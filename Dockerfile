@@ -28,7 +28,9 @@ WORKDIR /app
 
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
-
+ENV UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV UV_HTTP_TIMEOUT=300
+ENV UV_HTTP_RETRIES=10
 # Install dependencies
 RUN uv sync --frozen
 
