@@ -14,16 +14,13 @@ config = {
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
 
-    'pairwise_weight': 1, # 配对损失权重
-    'base_weight': 1.0, # 非top-k样本权重
-    'top5_weight': 2.0, # top-5样本权重（应大于base_weight）
+    'loss_temperature': 1.0, # Top5RankingLoss 温度参数
+    'pairwise_weight': 0.5, # 配对损失权重
 
     'output_dir': f'./model/{sequence_length}_{feature_num}',
     'data_path': './data',
 
 
-    'lgbm_output_dir': f'./model/lgbm_{feature_num}',
-    # LightGBM排序模型单独保存，不影响原Transformer模型
     'lgbm_output_dir': f'./model/lgbm_{feature_num}',
     'lgbm_early_stopping_rounds': 50,
     'lgbm_params': {

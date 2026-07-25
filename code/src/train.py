@@ -143,80 +143,93 @@ def preprocess_val_data(df, stockid2idx=None):
     return _preprocess_common(df, stockid2idx, desc="验证集特征工程", drop_small_open=True)
 
 
-# 加权的排序损失函数
-class WeightedRankingLoss(nn.Module):
+# Top5专用排名损失函数
+class Top5RankingLoss(nn.Module):
     """
-    组合的加权排序损失函数，着重强调top-k的样本。
+    Top5二元标签排名损失。
+
+    含义：
+    - listwise_loss：让模型概率集中到真实Top5，Top5内部等权。
+    - pairwise_loss：让真实Top5的预测分数高于所有非Top5。
+
+    不要求：
+    - Top5内部严格排序
+    - 非Top5内部严格排序
+    - 完整股票池全部排对
     """
-    def __init__(self, temperature=1.0, k=5, weight_factor=2.0, pairwise_weight=1, base_weight=1.0):
-        super(WeightedRankingLoss, self).__init__()
+    def __init__(
+        self,
+        temperature=1.0,
+        pairwise_weight=0.5,
+    ):
+        super().__init__()
+
         self.temperature = temperature
-        self.k = k
-        self.weight_factor = weight_factor
         self.pairwise_weight = pairwise_weight
-        self.base_weight = base_weight
 
-    def listwise_loss(self, y_pred, y_true, weights):
-        """加权的Listwise损失 (KL散度 + Cross Entropy)"""
-        
-        pred_probs = F.softmax(y_pred / self.temperature, dim=1)
-        target_probs = F.softmax(y_true / self.temperature, dim=1)
+    def forward(
+        self,
+        y_pred,
+        top5_labels,
+    ):
+        losses = []
 
-        # 加权 Cross Entropy（原实现未使用 weights）
-        weighted_ce = -(target_probs * torch.log(pred_probs + 1e-12) * weights)
-        ce_loss = (weighted_ce.sum(dim=1) / (weights.sum(dim=1) + 1e-12)).mean()
-        
-        return ce_loss
+        for batch_idx in range(y_pred.size(0)):
+            pred = y_pred[batch_idx]
+            labels = top5_labels[batch_idx]
 
-    def pairwise_loss(self, y_pred, y_true, weights):
-        """加权的Pairwise损失"""
-        batch_size, num_items = y_pred.size()
-        
-        pred_diff = y_pred.unsqueeze(2) - y_pred.unsqueeze(1)
-        true_diff = y_true.unsqueeze(2) - y_true.unsqueeze(1)
-        
-        # 只考虑真实标签不同的项目对
-        mask = (true_diff != 0).float()
-        
-        # 创建权重矩阵
-        # 如果一对(i, j)中，i或j是关键样本，则权重更高
-        weight_matrix = weights.unsqueeze(2) + weights.unsqueeze(1)
-        # weight_matrix = torch.where(weight_matrix > 2.0, self.weight_factor, 1.0)
-        
-        pairwise_loss = torch.sigmoid(-pred_diff * torch.sign(true_diff))
-        
-        # 应用mask和权重
-        weighted_loss = pairwise_loss * mask * weight_matrix
-        
-        num_pairs = mask.sum(dim=[1, 2]).clamp(min=1)
-        loss = (weighted_loss.sum(dim=[1, 2]) / num_pairs).mean()
-        
-        return loss
-        
-    def forward(self, y_pred, y_true):
-        """
-        y_pred: [batch, num_items]
-        y_true: [batch, num_items] (真实涨跌幅)
-        """
-        batch_size, num_items = y_true.size()
-        k = min(self.k, num_items)
+            valid_mask = (
+                torch.isfinite(pred)
+                & torch.isfinite(labels)
+            )
 
-        # 1. 识别 top-k 的样本
-        _, top_indices = torch.topk(y_true, k, dim=1)
-        
-        # 2. 创建权重向量
-        weights = torch.full_like(y_true, fill_value=self.base_weight)
-        for i in range(batch_size):
-            weights[i, top_indices[i]] = self.weight_factor
-            
-        # 3. 计算加权损失
-        listwise = self.listwise_loss(y_pred, y_true, weights)
-        pairwise = self.pairwise_loss(y_pred, y_true, weights)
-        
-        # 组合两种损失
-        total_loss = listwise + self.pairwise_weight * pairwise
-        
-        return total_loss
+            pred = pred[valid_mask]
+            labels = labels[valid_mask]
+
+            positive_mask = labels > 0.5
+            negative_mask = ~positive_mask
+
+            if positive_mask.sum() == 0:
+                continue
+
+            # Top5内部等权。
+            target_probability = (
+                labels / labels.sum()
+            )
+
+            listwise_loss = -(
+                target_probability
+                * F.log_softmax(
+                    pred / self.temperature,
+                    dim=0,
+                )
+            ).sum()
+
+            positive_scores = pred[positive_mask]
+            negative_scores = pred[negative_mask]
+
+            if negative_scores.numel() > 0:
+                pairwise_loss = F.softplus(
+                    -(
+                        positive_scores.unsqueeze(1)
+                        - negative_scores.unsqueeze(0)
+                    )
+                ).mean()
+            else:
+                pairwise_loss = pred.new_zeros(())
+
+            loss = (
+                listwise_loss
+                + self.pairwise_weight
+                * pairwise_loss
+            )
+
+            losses.append(loss)
+
+        if not losses:
+            return y_pred.sum() * 0.0
+
+        return torch.stack(losses).mean()
 
 def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
     """计算新的评估指标：Top 5 收益之和，以及与理论最高值和随机值的比值"""
@@ -286,10 +299,10 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
 
 class RankingDataset(torch.utils.data.Dataset):
     """排序数据集类"""
-    def __init__(self, sequences, targets, relevance_scores, stock_indices):
+    def __init__(self, sequences, targets, top5_labels, stock_indices):
         self.sequences = sequences
         self.targets = targets
-        self.relevance_scores = relevance_scores
+        self.top5_labels = top5_labels
         self.stock_indices = stock_indices
     
     def __len__(self):
@@ -299,7 +312,7 @@ class RankingDataset(torch.utils.data.Dataset):
         return {
             'sequences': torch.FloatTensor(self.sequences[idx]),  # [num_stocks, seq_len, features]
             'targets': torch.FloatTensor(self.targets[idx]),      # [num_stocks] 真实涨跌幅
-            'relevance': torch.LongTensor(self.relevance_scores[idx]),  # [num_stocks] 排序标签
+            'top5_labels': torch.FloatTensor(self.top5_labels[idx]),  # [num_stocks] Top5二元标签
             'stock_indices': torch.LongTensor(self.stock_indices[idx])  # [num_stocks] 股票索引
         }
 
@@ -307,7 +320,7 @@ def collate_fn(batch):
     """自定义collate函数处理变长序列"""
     sequences = [item['sequences'] for item in batch]
     targets = [item['targets'] for item in batch]
-    relevance = [item['relevance'] for item in batch]
+    top5_labels = [item['top5_labels'] for item in batch]
     stock_indices = [item['stock_indices'] for item in batch]
     
     # 找到最大股票数量
@@ -316,11 +329,11 @@ def collate_fn(batch):
     # Padding到相同长度
     padded_sequences = []
     padded_targets = []
-    padded_relevance = []
+    padded_top5_labels = []
     padded_stock_indices = []
     masks = []
     
-    for seq, tgt, rel, stock_idx in zip(sequences, targets, relevance, stock_indices):
+    for seq, tgt, t5l, stock_idx in zip(sequences, targets, top5_labels, stock_indices):
         num_stocks = seq.size(0)
         seq_len = seq.size(1)
         feature_dim = seq.size(2)
@@ -330,12 +343,12 @@ def collate_fn(batch):
             pad_size = max_stocks - num_stocks
             seq_pad = torch.zeros(pad_size, seq_len, feature_dim)
             tgt_pad = torch.zeros(pad_size)
-            rel_pad = torch.zeros(pad_size, dtype=torch.long)
+            t5l_pad = torch.zeros(pad_size, dtype=torch.float32)
             stock_pad = torch.zeros(pad_size, dtype=torch.long)
             
             seq = torch.cat([seq, seq_pad], dim=0)
             tgt = torch.cat([tgt, tgt_pad], dim=0)
-            rel = torch.cat([rel, rel_pad], dim=0)
+            t5l = torch.cat([t5l, t5l_pad], dim=0)
             stock_idx = torch.cat([stock_idx, stock_pad], dim=0)
         
         # 创建mask标记有效位置
@@ -344,14 +357,14 @@ def collate_fn(batch):
         
         padded_sequences.append(seq)
         padded_targets.append(tgt)
-        padded_relevance.append(rel)
+        padded_top5_labels.append(t5l)
         padded_stock_indices.append(stock_idx)
         masks.append(mask)
     
     return {
         'sequences': torch.stack(padded_sequences),      # [batch, max_stocks, seq_len, features]
         'targets': torch.stack(padded_targets),          # [batch, max_stocks]
-        'relevance': torch.stack(padded_relevance),      # [batch, max_stocks]
+        'top5_labels': torch.stack(padded_top5_labels),  # [batch, max_stocks]
         'stock_indices': torch.stack(padded_stock_indices),  # [batch, max_stocks]
         'masks': torch.stack(masks)                      # [batch, max_stocks]
     }
@@ -366,7 +379,7 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
     for batch in tqdm(dataloader, desc=f"Training Epoch {epoch+1}"):
         sequences = batch['sequences'].to(device)    # [batch, max_stocks, seq_len, features]
         targets = batch['targets'].to(device)        # [batch, max_stocks] 真实涨跌幅
-        relevance = batch['relevance'].to(device)    # [batch, max_stocks] 预处理的相关性得分
+        top5_labels = batch['top5_labels'].to(device)    # [batch, max_stocks] Top5二元标签
         masks = batch['masks'].to(device)            # [batch, max_stocks] 有效位置mask
         
         optimizer.zero_grad()
@@ -377,7 +390,7 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
         # 应用mask，只考虑有效股票
         masked_outputs = outputs * masks + (1 - masks) * (-1e9)  # 无效位置设为很小的值
         masked_targets = targets * masks
-        masked_relevance = relevance.float() * masks  # 使用预处理好的相关性得分
+        masked_top5_labels = top5_labels.float() * masks  # Top5二元标签
         
         # 计算损失（只对有效股票计算）
         batch_loss = None
@@ -393,13 +406,12 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
             if valid_indices.dim() == 0:
                 valid_indices = valid_indices.unsqueeze(0)
             
-            # 获取有效股票的预测值和预处理好的相关性得分
+            # 获取有效股票的预测值和Top5标签
             valid_pred = masked_outputs[i][valid_indices]
-            valid_relevance = masked_relevance[i][valid_indices]
+            valid_top5_labels = masked_top5_labels[i][valid_indices]
             
-            if len(valid_pred) > 1:
-                # 直接使用预处理好的相关性得分，无需重新计算
-                loss = criterion(valid_pred.unsqueeze(0), valid_relevance.unsqueeze(0))
+            if valid_pred.numel() > 1:
+                loss = criterion(valid_pred.unsqueeze(0), valid_top5_labels.unsqueeze(0))
                 batch_loss = batch_loss + loss if isinstance(batch_loss, torch.Tensor) else loss
         
         if batch_loss is not None:
@@ -444,6 +456,7 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
         for batch in tqdm(dataloader, desc=f"Evaluating Epoch {epoch+1}"):
             sequences = batch['sequences'].to(device)
             targets = batch['targets'].to(device)
+            top5_labels = batch['top5_labels'].to(device)
             masks = batch['masks'].to(device)
             
             # 模型预测
@@ -452,6 +465,7 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
             # 应用mask
             masked_outputs = outputs * masks + (1 - masks) * (-1e9)
             masked_targets = targets * masks
+            masked_top5_labels = top5_labels.float() * masks
             
             # 计算损失
             batch_loss = None
@@ -468,15 +482,10 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
                     valid_indices = valid_indices.unsqueeze(0)
                 
                 valid_pred = masked_outputs[i][valid_indices]
-                valid_true = masked_targets[i][valid_indices]
+                valid_top5_labels = masked_top5_labels[i][valid_indices]
                 
-                if len(valid_pred) > 1:
-                    _, sorted_indices = torch.sort(valid_true, descending=True)
-                    relevance_scores = torch.zeros_like(valid_true, requires_grad=False)
-                    relevance_scores[sorted_indices] = torch.arange(len(valid_true), 0, -1, device=device, dtype=torch.float32)
-                    relevance_scores = relevance_scores.detach()
-                    
-                    loss = criterion(valid_pred.unsqueeze(0), relevance_scores.unsqueeze(0))
+                if valid_pred.numel() > 1:
+                    loss = criterion(valid_pred.unsqueeze(0), valid_top5_labels.unsqueeze(0))
                     batch_loss = batch_loss + loss if batch_loss is not None else loss
             
             if batch_loss is not None:
@@ -646,13 +655,13 @@ def main():
 
     
     # 4. 创建排序数据集
-    train_sequences, train_targets, train_relevance, train_stock_indices = create_ranking_dataset_vectorized(
+    train_sequences, train_targets, train_top5_labels, train_stock_indices = create_ranking_dataset_vectorized(
         train_data,
         features,
         config['sequence_length'],
         ranking_data_path=config.get('train_ranking_data_path')
     )
-    val_sequences, val_targets, val_relevance, val_stock_indices = create_ranking_dataset_vectorized(
+    val_sequences, val_targets, val_top5_labels, val_stock_indices = create_ranking_dataset_vectorized(
         val_data,
         features,
         config['sequence_length'],
@@ -664,8 +673,8 @@ def main():
     print(f"验证集样本数: {len(val_sequences)}")
     
     # 5. 创建排序数据集和数据加载器
-    train_dataset = RankingDataset(train_sequences, train_targets, train_relevance, train_stock_indices)
-    val_dataset = RankingDataset(val_sequences, val_targets, val_relevance, val_stock_indices)
+    train_dataset = RankingDataset(train_sequences, train_targets, train_top5_labels, train_stock_indices)
+    val_dataset = RankingDataset(val_sequences, val_targets, val_top5_labels, val_stock_indices)
     
     train_loader = DataLoader(
         train_dataset, 
@@ -691,13 +700,10 @@ def main():
     print(f"模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     
     # 7. 损失函数和优化器
-    criterion = WeightedRankingLoss(
-        k=5,
-        temperature=1.0,
-        weight_factor=config['top5_weight'],
-        pairwise_weight=config['pairwise_weight'],
-        base_weight=config.get('base_weight', 1.0)
-    )  # 使用加权排序损失
+    criterion = Top5RankingLoss(
+        temperature=config.get('loss_temperature', 1.0),
+        pairwise_weight=config.get('pairwise_weight', 0.5),
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.2, total_iters=config['num_epochs'])
     

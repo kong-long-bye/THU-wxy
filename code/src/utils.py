@@ -402,18 +402,18 @@ def process_single_date(date, data, features, sequence_length):
                 day_stock_indices.append(stock_idx)
         
         if len(day_sequences) >= 10:  # 确保有足够的股票
-            # 创建排序标签：涨跌幅越高，相关性得分越高
             day_targets = np.array(day_targets)
-            # 使用涨跌幅的排序作为相关性得分（值越大排名越高）
-            sorted_indices = np.argsort(day_targets)[::-1]  # 降序排列
-            relevance = np.zeros_like(day_targets, dtype=np.float32)
-            for rank, idx in enumerate(sorted_indices):
-                relevance[idx] = len(day_targets) - rank  # 最高涨跌幅得分最高
-            
+
+            # Top5 二元标签
+            top5_labels = np.zeros_like(day_targets, dtype=np.float32)
+            k = min(5, len(day_targets))
+            top5_indices = np.argsort(-day_targets, kind="stable")[:k]
+            top5_labels[top5_indices] = 1.0
+
             return {
                 'sequences': np.array(day_sequences),
                 'targets': day_targets,
-                'relevance': relevance,
+                'top5_labels': top5_labels,
                 'stock_indices': day_stock_indices,
                 'date': date
             }
@@ -427,10 +427,10 @@ def process_single_date(date, data, features, sequence_length):
 def create_ranking_dataset_multiprocess(data, features, sequence_length, ranking_data_path=None, max_workers=None):
     """
     输入：股票历史数据 DataFrame，特征列名列表，序列长度，排名数据保存路径，最大工作进程数
-    输出：排序数据集，格式为：(sequences, targets, relevance_scores, stock_indices)
+    输出：排序数据集，格式为：(sequences, targets, top5_labels, stock_indices)
     - sequences: List of np.array, 每个元素形状为 (num_stocks, sequence_length, num_features)
     - targets: List of np.array, 每个元素形状为 (num_stocks,)
-    - relevance_scores: List of np.array, 每个元素形状为 (num_stocks,)
+    - top5_labels: List of np.array, 每个元素形状为 (num_stocks,)
     - stock_indices: List of List, 每个元素为对应股票的索引列表
     """
     """多进程版本的排序数据集创建函数"""
@@ -445,7 +445,7 @@ def create_ranking_dataset_multiprocess(data, features, sequence_length, ranking
     """
     sequences = []
     targets = []
-    relevance_scores = []
+    top5_labels = []
     stock_indices = []
     
     print("正在创建排序数据集（多线程版本）...")
@@ -491,7 +491,7 @@ def create_ranking_dataset_multiprocess(data, features, sequence_length, ranking
                     if result is not None:
                         sequences.append(result['sequences'])
                         targets.append(result['targets'])
-                        relevance_scores.append(result['relevance'])
+                        top5_labels.append(result['top5_labels'])
                         stock_indices.append(result['stock_indices'])
                         processed_count += 1
                 except Exception as e:
@@ -506,7 +506,7 @@ def create_ranking_dataset_multiprocess(data, features, sequence_length, ranking
             if result is not None:
                 sequences.append(result['sequences'])
                 targets.append(result['targets'])
-                relevance_scores.append(result['relevance'])
+                top5_labels.append(result['top5_labels'])
                 stock_indices.append(result['stock_indices'])
                 processed_count += 1
     
@@ -516,10 +516,10 @@ def create_ranking_dataset_multiprocess(data, features, sequence_length, ranking
     
     # 将四个数据保存下来，下次直接读取
     if ranking_data_path:
-        joblib.dump((sequences, targets, relevance_scores, stock_indices), ranking_data_path)
+        joblib.dump((sequences, targets, top5_labels, stock_indices), ranking_data_path)
         print(f"数据集已保存到: {ranking_data_path}")
     
-    return sequences, targets, relevance_scores, stock_indices
+    return sequences, targets, top5_labels, stock_indices
 
 def create_dataset(data, features, sequence_length, ranking_data_path=None):
     """保持原有接口，但内部调用新的排序数据集创建函数"""
@@ -595,10 +595,10 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
     # 5. 按 date 分组，构建每日样本
     sequences = []
     targets = []
-    relevance_scores = []
+    top5_labels = []
     stock_indices = []
 
-    print("Step 3: 构建每日样本并计算 relevance...")
+    print("Step 3: 构建每日样本并计算 Top5 标签...")
     grouped_by_date = window_df.groupby('date')
 
     if min_window_end_date is not None:
@@ -616,15 +616,15 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
         day_targets = group['target'].values              # (N,)
         day_stocks = group['stock_code'].tolist()         # [str]
 
-        # 计算 relevance（与原逻辑一致）
-        sorted_indices = np.argsort(day_targets)[::-1]
-        relevance = np.zeros_like(day_targets, dtype=np.float32)
-        for rank, idx in enumerate(sorted_indices):
-            relevance[idx] = len(day_targets) - rank
+        # Top5 二元标签
+        top5 = np.zeros_like(day_targets, dtype=np.float32)
+        k = min(5, len(day_targets))
+        top5_indices = np.argsort(-day_targets, kind="stable")[:k]
+        top5[top5_indices] = 1.0
 
         sequences.append(day_seqs)
         targets.append(day_targets)
-        relevance_scores.append(relevance)
+        top5_labels.append(top5)
         stock_indices.append(day_stocks)
 
     print(f"成功创建 {len(sequences)} 个训练样本")
@@ -634,7 +634,7 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
 
     # 6. 保存
     # if ranking_data_path:
-    #     joblib.dump((sequences, targets, relevance_scores, stock_indices), ranking_data_path)
+    #     joblib.dump((sequences, targets, top5_labels, stock_indices), ranking_data_path)
     #     print(f"数据集已保存到: {ranking_data_path}")
 
-    return sequences, targets, relevance_scores, stock_indices
+    return sequences, targets, top5_labels, stock_indices
