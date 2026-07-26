@@ -16,6 +16,54 @@ import os
 import json
 import multiprocessing as mp
 import random
+import sys
+import subprocess
+from datetime import datetime
+
+
+def _setup_console_logging():
+    """设置控制台日志，将输出同时输出到控制台和日志文件。"""
+    try:
+        branch = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except Exception:
+        branch = 'unknown'
+
+    # 将分支名中的路径分隔符替换为 '-'，避免产生子目录
+    branch = branch.replace('/', '-').replace('\\', '-')
+
+    log_dir = os.path.join('output', 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    log_file = os.path.join(log_dir, f'{branch}-{date_str}.log')
+
+    fh = open(log_file, 'a', encoding='utf-8')
+
+    class _Tee:
+        def __init__(self, *streams):
+            self.streams = streams
+
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+        def fileno(self):
+            return self.streams[0].fileno()
+
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+
+    print(f"[Log] 控制台输出已记录到: {os.path.abspath(log_file)}")
+
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -176,6 +224,7 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
     
     # Metrics accumulators
     pred_return_sum_list = []
+    pred_top5_return_list = [] # 前五个收益的平均值
     max_return_sum_list = []
     random_return_sum_list = []
     ratio_pred_list = []
@@ -196,6 +245,7 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
         _, pred_indices = torch.topk(valid_pred, k)
         pred_top_returns = valid_true[pred_indices]
         pred_return_sum = pred_top_returns.sum().item()
+        pred_top5_return = pred_top_returns.mean().item()
         
         # 2. True Top 5 (Theoretical Max)
         _, true_indices = torch.topk(valid_true, k)
@@ -213,6 +263,7 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
         final_score = (pred_return_sum - random_return_sum) / (denominator + 1e-12) if abs(denominator) > 1e-6 else 0.0
         
         pred_return_sum_list.append(pred_return_sum)
+        pred_top5_return_list.append(pred_top5_return)
         max_return_sum_list.append(max_return_sum)
         random_return_sum_list.append(random_return_sum)
         ratio_pred_list.append(ratio_pred)
@@ -221,6 +272,7 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
         
     metrics = {
         'pred_return_sum': np.mean(pred_return_sum_list) if pred_return_sum_list else 0.0,
+        'pred_top5_return': np.mean(pred_top5_return_list) if pred_top5_return_list else 0.0,
         'max_return_sum': np.mean(max_return_sum_list) if max_return_sum_list else 0.0,
         'random_return_sum': np.mean(random_return_sum_list) if random_return_sum_list else 0.0,
     }
@@ -549,6 +601,7 @@ def split_train_val_by_last_month(df, sequence_length):
 # 主程序
 def main():
     set_seed(config.get('seed', 42))
+    _setup_console_logging()
     output_dir = config['output_dir']
     os.makedirs(output_dir,exist_ok=True)
     # 保存在output_dir中保存当前的配置文件，以便复现
@@ -681,15 +734,23 @@ def main():
             
 
             # 保存最佳模型（基于final score）
-            current_final_score = eval_metrics.get('final_score', 0.0)
-            if current_final_score > best_score:
-                best_score = current_final_score
+            # current_final_score = eval_metrics.get('final_score', 0.0)
+            # if current_final_score > best_score:
+            #     best_score = current_final_score
+            #     best_epoch = epoch + 1
+            #     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
+            #     print(f"保存最佳模型 - final score: {best_score:.4f}")
+
+            # 保存最佳模型（基于pred_top5_return）
+            current_top5_return = eval_metrics.get('pred_top5_return', -float('inf'))
+            if current_top5_return > best_score:
+                best_score = current_top5_return
                 best_epoch = epoch + 1
                 torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
-                print(f"保存最佳模型 - final score: {best_score:.4f}")
-        print(f"\n训练完成！最佳 epoch: {best_epoch}, 最佳 final score: {best_score:.4f}")
+                print(f"保存最佳模型 - pred_top5_return: {best_score:.6f}")
+        print(f"\n训练完成！最佳 epoch: {best_epoch}, 最佳 pred_top5_return: {best_score:.6f}")
         with open(os.path.join(output_dir, 'final_score.txt'), 'w') as f:
-            f.write(f"Best epoch: {best_epoch}\\nBest final_score: {best_score:.6f}\\n")
+            f.write(f"Best epoch: {best_epoch}\nBest pred_top5_return: {best_score:.6f}\n")
 
         if writer:
             writer.close()
