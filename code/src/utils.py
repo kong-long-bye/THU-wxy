@@ -204,8 +204,16 @@ def engineer_features(df):
         feature_names.append(f'BETA{w}')
         
         # R-squared can be calculated as CORREL^2
-        time_period_series = pd.Series(range(w), index=close.index[:w])
-        rolling_corr = close.rolling(w).corr(time_period_series)
+        time_period_series = pd.Series(
+            range(len(close)),
+            index=close.index,
+        )
+
+        rolling_corr = close.rolling(
+            window=w,
+            min_periods=w,
+        ).corr(time_period_series)
+
         rsquare = rolling_corr**2
         features.append(rsquare)
         feature_names.append(f'RSQR{w}')
