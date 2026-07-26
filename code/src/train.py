@@ -43,23 +43,50 @@ def _setup_console_logging():
     fh = open(log_file, 'a', encoding='utf-8')
 
     class _Tee:
-        def __init__(self, *streams):
-            self.streams = streams
+        def __init__(self, console_stream, log_stream):
+            self.console_stream = console_stream
+            self.log_stream = log_stream
+            self.progress_buffer = ""
 
         def write(self, data):
-            for s in self.streams:
-                s.write(data)
-                s.flush()
+            # 控制台保持原样，让 tqdm 正常动态刷新
+            self.console_stream.write(data)
+            self.console_stream.flush()
+
+            # tqdm 使用 \r 刷新当前行
+            if "\r" in data:
+                # 保存最新进度，不立即写入日志
+                self.progress_buffer = data.split("\r")[-1]
+                return
+
+            # tqdm 完成时通常会输出换行
+            if data == "\n" and self.progress_buffer:
+                self.log_stream.write(self.progress_buffer.rstrip() + "\n")
+                self.log_stream.flush()
+                self.progress_buffer = ""
+                return
+
+            # 如果普通输出到来前还有进度条缓存，先写入最终进度
+            if self.progress_buffer:
+                self.log_stream.write(self.progress_buffer.rstrip() + "\n")
+                self.progress_buffer = ""
+
+            # 普通 print 输出直接记录
+            self.log_stream.write(data)
+            self.log_stream.flush()
 
         def flush(self):
-            for s in self.streams:
-                s.flush()
+            self.console_stream.flush()
+            self.log_stream.flush()
 
         def fileno(self):
-            return self.streams[0].fileno()
+            return self.console_stream.fileno()
 
-    sys.stdout = _Tee(sys.stdout, fh)
-    sys.stderr = _Tee(sys.stderr, fh)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    sys.stdout = _Tee(original_stdout, fh)
+    sys.stderr = _Tee(original_stderr, fh)
 
     print(f"[Log] 控制台输出已记录到: {os.path.abspath(log_file)}")
 
