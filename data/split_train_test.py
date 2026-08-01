@@ -29,8 +29,8 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument(
 		"--train-end",
 		type=str,
-		default="2026-07-31",
-		help="训练集结束日期，默认 2026-07-31",
+		default="2026-07-24",
+		help="训练集结束日期，默认 2026-07-24",
 	)
 	parser.add_argument(
 		"--test-start",
