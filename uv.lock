@@ -94,7 +94,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "akshare", specifier = ">=1.18.28" },
-    { name = "baostock", specifier = ">=0.8.9" },
+    { name = "baostock", specifier = ">=0.9.3" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "joblib", specifier = ">=1.5.2" },
     { name = "lightgbm", specifier = "==4.6.0" },
